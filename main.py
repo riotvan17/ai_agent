@@ -1,101 +1,82 @@
+import argparse
 import os
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from functions.call_function import available_functions, call_function
 import sys
 
+from call_function import available_functions, call_function
+from config import MAX_ITERS
+from dotenv import load_dotenv
+from openai import OpenAI
 
-system_prompt = """
-You are a helpful AI coding agent.
-
-When a user asks a question or makes a request, make a function call plan. You can perform the following operations:
-
-- List files and directories
-- Read file contents
-- Execute Python files with optional arguments
-- Write or overwrite files
-
-All paths you provide should be relative to the working directory. You do not need to specify the working directory in your function calls as it is automatically injected for security reasons.
-"""
+from prompts import system_prompt
 
 
-def main():
-	load_dotenv()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AI Code Assistant")
+    parser.add_argument("user_prompt", type=str, help="Prompt to send to the LLM")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    args = parser.parse_args()
 
-	verbose = "--verbose" in sys.argv
-	args = []
-	for arg in sys.argv[1:]:
-		if not arg.startswith("--"):
-			args.append(arg)
+    load_dotenv()
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY environment variable not set")
 
-	if not args:
-		print("AI Code Assistant")
-		print('\nUsage: python main.py "your prompt here" [--verbose]')
-		print('Example: python main.py "How do I fix the calculator?"')
-		sys.exit(1)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": args.user_prompt},
+    ]
+    if args.verbose:
+        print(f"User prompt: {args.user_prompt}\n")
 
-	api_key = os.environ.get("GEMINI_API_KEY")
-	client = genai.Client(api_key=api_key)
+    for _ in range(MAX_ITERS):
+        try:
+            final_response = generate_content(client, messages, args.verbose)
+            if final_response:
+                print("Final response:")
+                print(final_response)
+                return
+        except Exception as e:
+            print(f"Error in generate_content: {e}")
 
-	user_prompt = " ".join(args)
-
-	if verbose:
-		print(f"User prompt: {user_prompt}\n")
-
-	messages = [
-		types.Content(role="user", parts=[types.Part(text=user_prompt)]),
-	]
-	i = 0
-	while i < 10:
-		generate_content(client, messages, verbose)
-		i += 1
-		try:
-			final_response = generate_content(client, messages, verbose)
-			if final_response:
-				print("Final response:")
-				print(final_response)
-				break
-		except Exception as e:
-			print(f"Error in generate_content: {e}")
+    print(f"Maximum iterations ({MAX_ITERS}) reached")
+    sys.exit(1)
 
 
+def generate_content(client: OpenAI, messages: list, verbose: bool) -> str | None:
+    response = client.chat.completions.create(
+        model="openrouter/free",
+        messages=messages,
+        tools=available_functions,
+    )
+    if not response.usage:
+        raise RuntimeError("API response appears to be malformed")
 
-def generate_content(client, messages, verbose):
-	response = client.models.generate_content(
-		model="gemini-2.0-flash-001",
-		contents=messages,
-		config=types.GenerateContentConfig(
-			tools=[available_functions], system_instruction=system_prompt
-		),
-	)
-	if verbose:
-		print("Prompt tokens:", response.usage_metadata.prompt_token_count)
-		print("Response tokens:", response.usage_metadata.candidates_token_count)
+    if verbose:
+        print("Prompt tokens:", response.usage.prompt_tokens)
+        print("Response tokens:", response.usage.completion_tokens)
 
-	if not response.function_calls:
-		return response.text
+    message = response.choices[0].message
+    messages.append(message)
 
-	for candidate in response.candidates:
-			messages.append(candidate.content)
+    if not message.tool_calls:
+        return message.content
 
-	function_responses = []
-	for function_call_part in response.function_calls:
-		function_call_result = call_function(function_call_part, verbose)
-		if (
-			not function_call_result.parts
-			or not function_call_result.parts[0].function_response
-		):
-			raise Exception("empty function call result")
-		if verbose:
-			print(f"-> {function_call_result.parts[0].function_response.response}")
-		function_responses.append(function_call_result.parts[0])
-		messages.append(types.Content(role="user", parts=function_responses))
+    for tool_call in message.tool_calls:
+        if tool_call.type != "function":
+            continue
+        result_message = call_function(tool_call, verbose)
+        if not result_message.get("content"):
+            raise RuntimeError(f"Empty function response for {tool_call.function.name}")
+        if verbose:
+            print(f"-> {result_message['content']}")
+        messages.append(result_message)
 
-	if not function_responses:
-		raise Exception("no function responses generated, exiting.")
-
+    return None
 
 
 if __name__ == "__main__":
-	main()
+    main()
